@@ -1,0 +1,271 @@
+; ============================================================================
+; text_stats.asm - single-pass text statistics in x86-64 NASM (System V ABI)
+;
+; Purpose: walk a NUL-terminated string exactly once and report
+;   - how many vowels it contains
+;   - how many letters it contains
+;   - how many decimal digits it contains
+;   - how many words it contains (a word = a maximal run of letters/digits)
+;   - the length of the longest word
+;   - whether the text is vowel-heavy or consonant-heavy
+;
+; The program is built around one outer loop over the characters, one nested
+; loop over a lookup table, and two kinds of branching: an ordered comparison
+; chain that classifies a character, and a state check that detects word
+; boundaries.
+;
+; Build:  nasm -f elf64 -g text_stats.asm -o text_stats.o
+;         gcc -no-pie -g text_stats.o -o text_stats
+; Run:    ./text_stats
+; ============================================================================
+
+extern printf
+global main
+
+; ----------------------------------------------------------------------------
+; Read-only data
+; ----------------------------------------------------------------------------
+section .rodata
+    text:       db "Assembly in 2026: 7 loops, 3 branches, 0 regrets!", 0
+
+    ; Lookup table for the nested loop. Both cases are listed so the inner
+    ; loop needs no case conversion.
+    vowels:     db "aeiouAEIOU"
+    VOWELS_LEN  equ $ - vowels          ; assembler-time length: current
+                                        ; position minus the table start
+
+    fmt_header: db "--- statistics for: %s", 10, 10, 0
+    fmt_line:   db "%-14s: %ld", 10, 0
+    fmt_verdict:db 10, "verdict       : %s", 10, 0
+
+    lbl_letters:db "letters", 0
+    lbl_vowels: db "vowels", 0
+    lbl_digits: db "digits", 0
+    lbl_words:  db "words", 0
+    lbl_max:    db "longest word", 0
+
+    msg_vowel:  db "vowel-heavy (vowels are at least half the letters)", 0
+    msg_cons:   db "consonant-heavy", 0
+
+; ----------------------------------------------------------------------------
+; Results are parked in memory because every printf call destroys the
+; caller-saved registers the loop used. Storing them once is cheaper and
+; clearer than juggling six callee-saved registers.
+; ----------------------------------------------------------------------------
+section .bss
+    n_letters:  resq 1
+    n_vowels:   resq 1
+    n_digits:   resq 1
+    n_words:    resq 1
+    max_word:   resq 1
+
+section .text
+
+main:
+    push rbp
+    mov rbp, rsp
+    ; At function entry rsp is 8 mod 16 (the caller's `call` pushed a return
+    ; address). Pushing rbp restores 16-byte alignment, which every call to a
+    ; libc function requires. Nothing below pushes an odd number of qwords,
+    ; so alignment holds for the rest of main.
+
+    ; ========================================================================
+    ; PASS 1: classify every character in a single loop
+    ; ========================================================================
+    ; Register plan for the loop (all caller-saved - safe because the loop
+    ; performs no calls):
+    ;   rsi - cursor into the string
+    ;   eax - current character
+    ;   r8  - vowel count
+    ;   r9  - digit count
+    ;   r10 - word count
+    ;   r11 - longest word seen so far
+    ;   rcx - length of the word currently being scanned (0 = between words)
+    ;   rbx - letter count
+    ; rbx is callee-saved, so it must be preserved for our caller.
+    push rbx
+
+    lea rsi, [rel text]                 ; RIP-relative: works in PIE and non-PIE
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    xor r11, r11
+    xor rcx, rcx
+    xor rbx, rbx
+
+.next_char:
+    movzx eax, byte [rsi]               ; zero-extend: a char is unsigned here,
+                                        ; movsx would turn bytes >= 0x80 into
+                                        ; negative values and break the compares
+    test al, al
+    jz .end_of_text                     ; NUL terminator -> stop
+    inc rsi                             ; advance now; every path below continues
+
+    ; --- decision chain, ordered by ASCII value ---------------------------
+    ; '0'(0x30) < '9'(0x39) < 'A'(0x41) < 'Z'(0x5A) < 'a'(0x61) < 'z'(0x7A)
+    ; Walking the ranges in ascending order means each `jb` can reject
+    ; everything below the current range without re-testing earlier ones.
+    ; Unsigned compares (jb/jbe) are correct because the char was zero-extended.
+    cmp al, '0'
+    jb .separator
+    cmp al, '9'
+    jbe .digit
+    cmp al, 'A'
+    jb .separator                       ; punctuation between '9' and 'A'
+    cmp al, 'Z'
+    jbe .letter
+    cmp al, 'a'
+    jb .separator                       ; punctuation between 'Z' and 'a'
+    cmp al, 'z'
+    jbe .letter
+    jmp .separator                      ; anything above 'z'
+
+.digit:
+    inc r9
+    inc rcx                             ; digits are part of a word
+    jmp .next_char
+
+.letter:
+    inc rbx
+    inc rcx
+
+    ; --- nested loop: is this letter in the vowel table? ------------------
+    ; Linear search over VOWELS_LEN entries. rdi walks the table, edx counts
+    ; down the remaining entries so the loop always terminates.
+    lea rdi, [rel vowels]
+    mov edx, VOWELS_LEN
+.vowel_scan:
+    cmp al, [rdi]
+    je .is_vowel                        ; early exit on a hit
+    inc rdi
+    dec edx
+    jnz .vowel_scan
+    jmp .next_char                      ; table exhausted -> consonant
+.is_vowel:
+    inc r8
+    jmp .next_char
+
+.separator:
+    ; A separator only matters if it terminates a word. rcx doubles as the
+    ; state flag: rcx == 0 means we were already between words, so runs of
+    ; consecutive separators are collapsed instead of counted repeatedly.
+    test rcx, rcx
+    jz .next_char
+    inc r10                             ; a word just ended
+    cmp rcx, r11
+    jbe .word_closed                    ; not a new record
+    mov r11, rcx                        ; new longest word
+.word_closed:
+    xor rcx, rcx                        ; reset the run length
+    jmp .next_char
+
+.end_of_text:
+    ; The string may end mid-word ("...!" ends on a separator, but "...end"
+    ; would not), so the pending run has to be closed here too. Without this
+    ; the final word would be silently dropped.
+    test rcx, rcx
+    jz .store
+    inc r10
+    cmp rcx, r11
+    jbe .store
+    mov r11, rcx
+
+.store:
+    mov [rel n_letters], rbx
+    mov [rel n_vowels], r8
+    mov [rel n_digits], r9
+    mov [rel n_words], r10
+    mov [rel max_word], r11
+
+    pop rbx                             ; restore the caller's rbx
+
+    ; ========================================================================
+    ; PASS 2: report
+    ; ========================================================================
+    ; printf is variadic: integer arguments go in rdi, rsi, rdx, rcx, r8, r9,
+    ; and al must hold the number of vector registers used - zero here.
+    lea rdi, [rel fmt_header]
+    lea rsi, [rel text]
+    xor eax, eax
+    call printf
+
+    lea rdi, [rel fmt_line]
+    lea rsi, [rel lbl_letters]
+    mov rdx, [rel n_letters]
+    xor eax, eax
+    call printf
+
+    lea rdi, [rel fmt_line]
+    lea rsi, [rel lbl_vowels]
+    mov rdx, [rel n_vowels]
+    xor eax, eax
+    call printf
+
+    lea rdi, [rel fmt_line]
+    lea rsi, [rel lbl_digits]
+    mov rdx, [rel n_digits]
+    xor eax, eax
+    call printf
+
+    lea rdi, [rel fmt_line]
+    lea rsi, [rel lbl_words]
+    mov rdx, [rel n_words]
+    xor eax, eax
+    call printf
+
+    lea rdi, [rel fmt_line]
+    lea rsi, [rel lbl_max]
+    mov rdx, [rel max_word]
+    xor eax, eax
+    call printf
+
+    ; --- final branch: vowels * 2 >= letters ? ----------------------------
+    ; Comparing 2*vowels against letters avoids division entirely; the shift
+    ; is the cheap way to double. rsi is set on both paths, then a single
+    ; call site prints whichever message was selected.
+    mov rax, [rel n_vowels]
+    shl rax, 1
+    cmp rax, [rel n_letters]
+    jb .consonant_heavy
+    lea rsi, [rel msg_vowel]
+    jmp .print_verdict
+.consonant_heavy:
+    lea rsi, [rel msg_cons]
+.print_verdict:
+    lea rdi, [rel fmt_verdict]
+    xor eax, eax
+    call printf
+
+    xor eax, eax                        ; return 0
+    leave
+    ret
+
+; ============================================================================
+; VERIFICATION
+;
+; For the string "Assembly in 2026: 7 loops, 3 branches, 0 regrets!" the words
+; are: Assembly | in | 2026 | 7 | loops | 3 | branches | 0 | regrets
+;
+; Expected output:
+;   --- statistics for: Assembly in 2026: 7 loops, 3 branches, 0 regrets!
+;
+;   letters       : 30
+;   vowels        : 9
+;   digits        : 7
+;   words         : 9
+;   longest word  : 8
+;
+;   verdict       : consonant-heavy
+;
+; Hand-check: vowels are A,e (Assembly) i (in) o,o (loops) a,e (branches)
+; e,e (regrets) = 9; 'y' is not in the table. Letters 8+2+5+8+7 = 30.
+; Digits 2,0,2,6,7,3,0 = 7. Longest is "Assembly"/"branches", both 8.
+; 9*2 = 18 < 30, so the verdict is consonant-heavy.
+;
+; To watch the loop state:
+;   gdb ./text_stats
+;   (gdb) break *&main
+;   (gdb) run
+;   (gdb) watch $rcx          # current word length, resets at each boundary
+;   (gdb) info registers r8 r9 r10 r11
+; ============================================================================
