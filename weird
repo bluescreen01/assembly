@@ -1,0 +1,85 @@
+%include "printf32.asm"
+
+section .rodata
+    weird: db "byteme", 10, 0
+
+
+section .text
+extern printf
+global main
+
+main:
+    push ebp
+    mov ebp, esp
+
+
+    ; TODO a: Determine whether the signed integer saved at the
+    ; middle of the `weird` array is positive.
+    ; NOTE: You must print "The number <nr> is positive" if nr
+    ; is higher that 0, or "The number <nr> is negative", otherwise.
+
+    ; Vectorul are 8 bytes, deci dword-ul "din mijloc" incepe la offsetul 2
+    ; (2 octeti inainte, 2 octeti dupa): 74 65 6D 65 -> 0x656D6574
+    mov eax, [weird + 2]
+    cmp eax, 0
+    jg .a_positive
+    PRINTF32 `"a) The number %d is negative\n"`, eax
+    jmp .a_done
+.a_positive:
+    PRINTF32 `"a) The number %d is positive\n"`, eax
+.a_done:
+
+    ; TODO b: Determine whether the signed quad word
+    ; represented by the `weird` array is odd or even.
+    ; NOTE: You must print "The number <nr> is odd" if nr
+    ; is odd, or "The number <nr> is even", otherwise.
+    ; ---------------- b) par sau impar ----------------
+    ; Paritatea unui numar pe 64 de biti depinde doar de bitul 0,
+    ; adica de bitul 0 al octetului de la offsetul 0.
+    mov eax, [weird]        ; dword-ul low
+    mov edx, [weird + 4]    ; dword-ul high
+    test eax, 1
+    jnz .b_odd
+    PRINTF32 `"b) The number 0x%llx is even\n"`, eax, edx
+    jmp .b_done
+.b_odd:
+    PRINTF32 `"b) The number 0x%llx is odd\n"`, eax, edx
+.b_done:
+
+
+    ; TODO c: Determine the number of set bits inside the
+    ; `weird` array.
+    ; NOTE: You must print the result.
+
+    ; ---------------- c) numarul de biti setati ----------------
+    xor edx, edx                    ; edx = numaratorul de biti setati
+    xor ecx, ecx                    ; ecx = indexul octetului curent
+.c_byte_loop:
+    movzx eax, byte [weird + ecx]   ; extinde octetul curent la dword
+.c_bit_loop:
+    test eax, eax
+    jz .c_next_byte                 ; nu mai sunt biti setati in acest octet
+    shr eax, 1                      ; bitul iesit ajunge in CF
+    jnc .c_bit_loop
+    inc edx
+    jmp .c_bit_loop
+.c_next_byte:
+    inc ecx
+    cmp ecx, 8
+    jl .c_byte_loop
+ 
+    PRINTF32 `"c) Number of set bits: %d\n"`, edx
+
+    ; ---------------- d) adresa primei instructiuni din main ----------------
+    ; call-ul pune pe stiva adresa instructiunii urmatoare (.d_here);
+    ; scazand distanta pana la `main` obtinem chiar adresa lui main.
+    call .d_here
+.d_here:
+    pop eax
+    sub eax, .d_here - main
+    PRINTF32 `"d) Address of first main instruction: %p\n"`, eax
+
+    ; Return 0.
+    xor eax, eax
+    leave
+    ret
