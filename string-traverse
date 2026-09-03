@@ -23,7 +23,7 @@ extern printf
 global main
 
 ; ----------------------------------------------------------------------------
-; Read-only data
+; Read-only data 
 ; ----------------------------------------------------------------------------
 section .rodata
     text:       db "Assembly in 2026: 7 loops, 3 branches, 0 regrets!", 0
