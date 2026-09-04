@@ -101,6 +101,531 @@ main:
     jz .end_of_text                     ; NUL terminator -> stop
     inc rsi                             ; advance now; every path below continues
 
+
+;;
+%include "printf64.asm"
+
+section .bss
+    answer resw 20
+
+section .data
+    products     dw 0x10AD, 0x234D, 0x03AD, 0x7E00, 0x0AFE, 0x00A1, 0x1B32, 0x0, 0x1, 0xA, 0x00CB, 0xFF, 0x1123, 0xFFFF, 0x64, 0x3FBC, 0x128, 0x341, 0x2345, 0x1AFE
+    products_len equ 20
+    c_answer_len equ 5
+
+; Named constants instead of magic numbers.
+DIVISOR       equ 23        ; modulus used by subpoints a) and d)
+WORD_SIZE     equ 2         ; each vector element is a 16-bit word
+MSB_FLIP_MASK equ 0xFF00    ; XOR mask that inverts only the high byte of a word
+POS_STEP_3    equ 3         ; position-multiplicity checks for subpoint c)
+POS_STEP_5    equ 5
+
+section .text
+extern printf
+global main
+
+main:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+; ============================================================
+; a) remainder of each element divided by 23 -> answer[i],
+;    then print all remainders on one line, space-separated
+; ============================================================
+    ; rbx = element index. rbx is callee-saved, so it survives the
+    ; printf call hidden inside PRINTF64 without extra bookkeeping.
+    xor ebx, ebx
+.a_loop:
+    ; Elements are 16-bit words; movzx (zero-extension) is the right
+    ; choice because the data is treated as unsigned magnitudes
+    ; (0xFFFF must mean 65535, not -1, for 65535 mod 23 = 8).
+    lea rsi, [rel products]
+    movzx eax, word [rsi + rbx*WORD_SIZE]
+    ; Unsigned 64-bit division: rdx:rax / rcx. rdx must be zeroed
+    ; first or DIV computes garbage / faults. Remainder lands in rdx.
+    xor edx, edx
+    mov ecx, DIVISOR
+    div rcx
+    ; Store the remainder on the matching answer position. The value
+    ; is < 23 so it fits in a word without truncation.
+    lea rdi, [rel answer]
+    mov word [rdi + rbx*WORD_SIZE], dx
+    ; Print "<rem> ". rdx holds the full 64-bit remainder, so %ld is
+    ; the correct conversion for a 64-bit argument.
+    PRINTF64 `%ld `, rdx
+    inc rbx
+    cmp rbx, products_len
+    jb .a_loop
+    PRINTF64 `\n`
+; VERIFICATION:
+; Hand-computed remainders of the 20 elements mod 23
+; (0x10AD=4269 -> 14, 0x234D=9037 -> 21, ..., 0x1AFE=6910 -> 10):
+;   14 21 21 10 8 0 16 0 1 10 19 2 17 8 8 9 20 5 13 10
+; gdb check after the loop: x/20dh &answer
+;   -> 14 21 21 10 8 0 16 0 1 10 19 2 17 8 8 9 20 5 13 10
+
+; ============================================================
+; b) product of (count of even elements) * (count of odd
+;    elements), stored in answer[0] and printed
+; ============================================================
+    ; rbx = index, r12 = odd counter. Only the low bit of each element
+    ; decides parity, so a single byte load of the little-endian LSB
+    ; (byte offset 2*i) is sufficient.
+    xor ebx, ebx
+    xor r12d, r12d
+.b_loop:
+    lea rsi, [rel products]
+    movzx eax, byte [rsi + rbx*WORD_SIZE]
+    and eax, 1              ; eax = 1 if element is odd, 0 if even
+    add r12, rax            ; accumulate the odd count
+    inc rbx
+    cmp rbx, products_len
+    jb .b_loop
+    ; even_count = total - odd_count; product = even_count * odd_count
+    mov rax, products_len
+    sub rax, r12
+    imul rax, r12           ; 9 * 11 = 99, fits in a word with room to spare
+    lea rdi, [rel answer]
+    mov word [rdi], ax
+    PRINTF64 `%ld\n`, rax
+; VERIFICATION:
+; Even elements (bit 0 of LSB clear): 0x7E00, 0x0AFE, 0x1B32, 0x0,
+; 0xA, 0x64, 0x3FBC, 0x128, 0x1AFE -> 9 evens, hence 20-9 = 11 odds.
+; Expected printed value: 9 * 11 = 99
+; gdb: x/1dh &answer  ->  99
+
+; ============================================================
+; c) for positions multiple of 3 or 5: if the element's most
+;    significant byte is even, flip that byte and append the
+;    word to answer; print the c_answer_len results in hex
+; ============================================================
+    ; rbx = source index, r12 = number of results already stored
+    ; (i.e. the "next free position" in answer). Subpoints are
+    ; independent, so results are written from answer[0] onward,
+    ; overwriting the already-printed data of a)/b).
+    xor ebx, ebx
+    xor r12d, r12d
+.c_loop:
+    ; Position test: i mod 3 == 0 OR i mod 5 == 0 (index 0 qualifies).
+    mov rax, rbx
+    xor edx, edx
+    mov ecx, POS_STEP_3
+    div rcx
+    test rdx, rdx           ; ZF=1 iff i is a multiple of 3
+    jz .c_pos_ok
+    mov rax, rbx
+    xor edx, edx
+    mov ecx, POS_STEP_5
+    div rcx
+    test rdx, rdx           ; ZF=1 iff i is a multiple of 5
+    jnz .c_next             ; neither multiple -> skip this element
+.c_pos_ok:
+    ; Little-endian layout: the word at byte offset 2*i is stored as
+    ; [LSB][MSB], so the most significant byte sits at offset 2*i+1.
+    ; E.g. element 0 = 0x10AD lies in memory as bytes AD 10; loading
+    ; the whole word rebuilds the value 0x10AD.
+    lea rsi, [rel products]
+    ; movzx: raw bit pattern, no sign meaning; sign extension would
+    ; later corrupt hex output of values like 0xEFAD.
+    movzx eax, word [rsi + rbx*WORD_SIZE]
+    ; MSB parity = bit 0 of the high byte = bit 8 of the word.
+    test eax, 0x0100        ; ZF=1 iff the MSB is even
+    jnz .c_next             ; MSB odd -> element is skipped
+    ; Flip only the high byte: XOR with 0xFF00 inverts bits 8..15 and
+    ; leaves the low byte untouched (0x10AD -> 0xEFAD).
+    xor eax, MSB_FLIP_MASK
+    lea rdi, [rel answer]
+    mov word [rdi + r12*WORD_SIZE], ax
+    inc r12
+.c_next:
+    inc rbx
+    cmp rbx, products_len
+    jb .c_loop
+    ; Print what was actually stored; for this input exactly
+    ; c_answer_len (5) words were produced, so r12 == c_answer_len.
+    xor ebx, ebx
+.c_print:
+    lea rsi, [rel answer]
+    movzx eax, word [rsi + rbx*WORD_SIZE]   ; zero-extend: %lx expects a clean 64-bit value
+    PRINTF64 `%lx `, rax
+    inc rbx
+    cmp rbx, r12
+    jb .c_print
+    PRINTF64 `\n`
+; VERIFICATION:
+; Positions that are multiples of 3 or 5: 0,3,5,6,9,10,12,15,18.
+;   i=0:  0x10AD, MSB 0x10 even -> 0xEFAD
+;   i=3:  0x7E00, MSB 0x7E even -> 0x8100
+;   i=5:  0x00A1, MSB 0x00 even -> 0xFFA1
+;   i=6:  0x1B32, MSB 0x1B odd  -> skipped
+;   i=9:  0x000A, MSB 0x00 even -> 0xFF0A
+;   i=10: 0x00CB, MSB 0x00 even -> 0xFFCB
+;   i=12,15,18: MSBs 0x11, 0x3F, 0x23 all odd -> skipped
+; Expected line: efad 8100 ffa1 ff0a ffcb   (exactly c_answer_len = 5 values)
+; gdb: x/5xh &answer  ->  0xefad 0x8100 0xffa1 0xff0a 0xffcb
+
+; ============================================================
+; d) count the elements divisible by 23 and print the count
+; ============================================================
+    ; rbx = index, r12 = divisibility counter; callee-saved so the
+    ; counter is guaranteed intact at the final PRINTF64 call site.
+    xor ebx, ebx
+    xor r12d, r12d
+.d_loop:
+    lea rsi, [rel products]
+    movzx eax, word [rsi + rbx*WORD_SIZE]   ; unsigned words -> zero-extension
+    xor edx, edx
+    mov ecx, DIVISOR
+    div rcx
+    ; DIV leaves flags undefined; the remainder must be tested explicitly.
+    test rdx, rdx           ; ZF=1 iff element mod 23 == 0
+    jnz .d_not_div
+    inc r12
+.d_not_div:
+    inc rbx
+    cmp rbx, products_len
+    jb .d_loop
+    PRINTF64 `%ld\n`, r12
+; VERIFICATION:
+; From the remainder list in a), only indices 5 (0x00A1 = 7*23) and
+; 7 (0x0000 = 0*23) have remainder 0.
+; Expected printed value: 2
+; gdb breakpoint on the last PRINTF64: p $r12  ->  2
+
+    ; Return 0.
+    xor rax, rax
+    pop r12
+    pop rbx
+    leave
+    ret
+
+;;
+
+
+extern printf
+extern scanf
+extern calloc
+extern strlen
+; `free` added to the skeleton's extern list: the exercise rules require every
+; allocation to be paired with its release, and read_string allocates on the heap.
+extern free
+
+section .rodata
+    read_fmt         db "%63s", 0
+    str_fmt_newline  db "%s", 10, 0
+    int_fmt_newline  db "%d", 10, 0
+
+section .data
+    N dq 64
+
+; Character constants instead of magic numbers.
+CHAR_A     equ 'a'
+CHAR_B     equ 'b'
+CHAR_X     equ 'X'          ; replacement character for subpoint c)
+ELEM_SIZE  equ 1            ; calloc element size: one byte per char
+
+section .text
+global main
+
+; ============================================================
+; a) char* read_string(void): calloc N zeroed bytes, scanf at
+;    most N-1 chars into them, return the buffer address
+; ============================================================
+read_string:
+    push rbp
+    mov rbp, rsp
+    ; rbx will hold the buffer pointer across the scanf call (scanf may
+    ; clobber every caller-saved register, so a callee-saved one is the
+    ; natural home for a value that must survive the call).
+    push rbx
+    ; Alignment: at entry rsp ≡ 8 (mod 16) because `call` pushed the
+    ; 8-byte return address; push rbp -> ≡ 0; push rbx -> ≡ 8; this
+    ; sub restores ≡ 0 so every `call` below is made with rsp 16-aligned.
+    sub rsp, 8
+
+    ; calloc(N, 1): rdi = element count, rsi = element size (SysV: first
+    ; two integer args in rdi, rsi). calloc zero-fills, which both
+    ; satisfies "initialized with 0" and guarantees NUL termination as
+    ; long as scanf writes at most N-1 characters.
+    mov rdi, [rel N]
+    mov esi, ELEM_SIZE
+    call calloc
+    ; Allocation check: a NULL return must not be handed to scanf.
+    test rax, rax
+    jz .a_done                  ; on failure, return NULL to the caller
+    mov rbx, rax                ; rbx = buffer, safe across the next call
+
+    ; scanf("%63s", buf): "%63s" stops after 63 = N-1 characters, so the
+    ; final zero byte left by calloc is never overwritten.
+    lea rdi, [rel read_fmt]
+    mov rsi, rbx
+    ; scanf is variadic: al must hold the number of vector registers
+    ; used (zero here).
+    xor eax, eax
+    call scanf
+    mov rax, rbx                ; return value = buffer address
+.a_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+; VERIFICATION:
+; With input.txt starting with the line "hello", main prints "hello".
+; gdb: break after `call read_string` in main, then `x/s $rax` -> "hello".
+; valgrind ./file < input.txt -> "All heap blocks were freed -- no leaks
+; are possible" (every read_string buffer is released with free in main).
+
+; ============================================================
+; b) int is_vowel(char c): 1 if c is one of a,e,i,o,u, else 0
+; ============================================================
+is_vowel:
+    push rbp
+    mov rbp, rsp
+    ; Leaf function: no calls are made, so no alignment padding and no
+    ; callee-saved registers are needed.
+    ; The char argument arrives in dil (low byte of rdi); the ABI does
+    ; NOT guarantee anything about the upper 56 bits of rdi for a char,
+    ; so only the 8-bit register may be compared.
+    mov eax, 1                  ; optimistic result: "is a vowel"
+    cmp dil, 'a'
+    je .b_yes
+    cmp dil, 'e'
+    je .b_yes
+    cmp dil, 'i'
+    je .b_yes
+    cmp dil, 'o'
+    je .b_yes
+    cmp dil, 'u'
+    je .b_yes
+    xor eax, eax                ; none matched -> 0
+.b_yes:
+    leave
+    ret
+; VERIFICATION:
+; main calls is_vowel('a') then is_vowel('b') and prints each result
+; with int_fmt_newline; expected output lines:
+;   1
+;   0
+; gdb: `p (int)is_vowel('u')` -> 1, `p (int)is_vowel('z')` -> 0.
+
+; ============================================================
+; c) void replace_vowels(char *s): overwrite every vowel of the
+;    string with the character 'X' (in place)
+; ============================================================
+replace_vowels:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    ; Same alignment argument as in read_string: 8+8+8 pushed so far,
+    ; this sub brings rsp back to a 16-byte boundary for the calls below.
+    sub rsp, 8
+
+    ; rbx = cursor into the string. It must be callee-saved because
+    ; is_vowel is called once per character and calls may destroy every
+    ; caller-saved register.
+    mov rbx, rdi
+.c_loop:
+    ; rbx points at the current character of the caller's string.
+    ; movzx: a char used as data is zero-extended; sign extension would
+    ; be wrong only for bytes >= 0x80, but being explicit costs nothing
+    ; and the full 32-bit register is what the ABI expects for the arg.
+    movzx edi, byte [rbx]
+    test dil, dil
+    jz .c_done                  ; NUL terminator -> whole string processed
+    ; Reuse the subpoint-b function instead of duplicating the vowel test.
+    call is_vowel
+    test eax, eax               ; eax = 1 -> current char is a vowel
+    jz .c_next
+    mov byte [rbx], CHAR_X      ; overwrite the vowel in place
+.c_next:
+    inc rbx
+    jmp .c_loop
+.c_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+; VERIFICATION:
+; Second line of input.txt is "world"; 'o' is its only vowel, so main
+; prints "wXrld".
+; gdb: break after `call replace_vowels` in main, `x/s $rbx` -> "wXrld".
+
+; ============================================================
+; d) int is_palindrome(char *s): 1 if s reads the same left to
+;    right and right to left, 0 otherwise
+; ============================================================
+is_palindrome:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8                  ; 16-byte alignment for the strlen call
+
+    ; The string pointer must survive the strlen call -> park it in rbx.
+    mov rbx, rdi
+    call strlen                 ; rax = number of characters before the NUL
+    ; Two-pointer scan: rcx walks from the first character, rdx from the
+    ; last one (s + len - 1). For an empty string rdx = s - 1 < rcx and
+    ; the loop exits immediately with result 1, which is correct.
+    mov rcx, rbx
+    lea rdx, [rbx + rax - 1]
+.d_loop:
+    ; Loop invariant: every pair outside [rcx, rdx] already matched.
+    cmp rcx, rdx
+    jae .d_yes                  ; pointers met or crossed -> palindrome
+    mov al, [rcx]
+    cmp al, [rdx]
+    jne .d_no                   ; mirror pair differs -> not a palindrome
+    inc rcx
+    dec rdx
+    jmp .d_loop
+.d_yes:
+    mov eax, 1
+    jmp .d_done
+.d_no:
+    xor eax, eax
+.d_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+; VERIFICATION:
+; Lines 3 and 4 of input.txt are "ana" and "test":
+;   "ana":  a==a, middle char alone -> 1
+;   "test": 't' != 't'? yes first pair matches (t,t), then 'e' != 's' -> 0
+; Expected printed lines: 1 then 0.
+; gdb: `p (int)is_palindrome("racecar")` -> 1.
+
+; ============================================================
+; main: drives all four subpoints
+; ============================================================
+main:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    ; Skeleton prologue: push rbp (rsp ≡ 0 mod 16) + push rbx (≡ 8) +
+    ; sub 8 (≡ 0) keeps rsp 16-byte aligned at every call below.
+    sub rsp, 8
+
+; ============================================================
+; a) read a string and print it with str_fmt_newline
+; ============================================================
+    call read_string
+    ; The heap pointer must survive the printf and free calls -> rbx.
+    mov rbx, rax
+    ; Allocation check in the caller as well: printing/freeing NULL is
+    ; skipped if calloc failed inside read_string.
+    test rbx, rbx
+    jz .a_main_done
+    lea rdi, [rel str_fmt_newline]
+    mov rsi, rbx
+    xor eax, eax                ; variadic call: 0 vector registers in al
+    call printf
+    ; Release of the subpoint-a allocation (paired with calloc).
+    mov rdi, rbx
+    call free
+.a_main_done:
+; VERIFICATION:
+; echo "hello world ana test" | ./file  (or ./file < input.txt with those
+; four whitespace-separated tokens) -> first output line: hello
+
+; ============================================================
+; b) print is_vowel('a') and is_vowel('b')
+; ============================================================
+    ; char argument travels in the low byte of rdi; mov edi also clears
+    ; the upper bits, so is_vowel sees a clean value.
+    mov edi, CHAR_A
+    call is_vowel
+    lea rdi, [rel int_fmt_newline]
+    ; is_vowel returns a C int -> the low 32 bits of rax are the value
+    ; and %d (not %ld) is the matching conversion.
+    mov esi, eax
+    xor eax, eax
+    call printf
+
+    mov edi, CHAR_B
+    call is_vowel
+    lea rdi, [rel int_fmt_newline]
+    mov esi, eax
+    xor eax, eax
+    call printf
+; VERIFICATION:
+; Output lines 2 and 3, independent of stdin:
+;   1        ('a' is a vowel)
+;   0        ('b' is not)
+
+; ============================================================
+; c) read a new string, replace its vowels with 'X', print it
+; ============================================================
+    call read_string
+    mov rbx, rax                ; heap buffer, must outlive two calls
+    test rbx, rbx
+    jz .c_main_done
+    mov rdi, rbx
+    call replace_vowels
+    lea rdi, [rel str_fmt_newline]
+    mov rsi, rbx
+    xor eax, eax
+    call printf
+    mov rdi, rbx                ; pair the c) allocation with its free
+    call free
+.c_main_done:
+; VERIFICATION:
+; For the second input token "world" the printed line is: wXrld
+
+; ============================================================
+; d) read two strings, print is_palindrome for each
+; ============================================================
+    ; --- first test string ---
+    call read_string
+    mov rbx, rax
+    test rbx, rbx
+    jz .d_first_done
+    mov rdi, rbx
+    call is_palindrome
+    lea rdi, [rel int_fmt_newline]
+    mov esi, eax                ; int result -> %d
+    xor eax, eax
+    call printf
+    mov rdi, rbx
+    call free
+.d_first_done:
+    ; --- second test string ---
+    call read_string
+    mov rbx, rax
+    test rbx, rbx
+    jz .d_second_done
+    mov rdi, rbx
+    call is_palindrome
+    lea rdi, [rel int_fmt_newline]
+    mov esi, eax
+    xor eax, eax
+    call printf
+    mov rdi, rbx
+    call free
+.d_second_done:
+; VERIFICATION:
+; For input tokens 3 and 4 = "ana", "test" the printed lines are:
+;   1
+;   0
+; Full expected output for `printf 'hello\nworld\nana\ntest\n' | ./file`:
+;   hello
+;   1
+;   0
+;   wXrld
+;   1
+;   0
+; valgrind ./file < input.txt -> 0 bytes in use at exit, 4 allocs, 4 frees.
+
+    ; Return 0.
+    xor rax, rax
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+;;
     ; --- decision chain, ordered by ASCII value ---------------------------
     ; '0'(0x30) < '9'(0x39) < 'A'(0x41) < 'Z'(0x5A) < 'a'(0x61) < 'z'(0x7A)
     ; Walking the ranges in ascending order means each `jb` can reject
