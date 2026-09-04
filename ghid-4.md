@@ -1,11 +1,9 @@
-# Subiectul 3 — Build errors & binary inspection
-
 x86-64 NASM/C project on the PCLP2 VM. Answers in statement order. All fixes are
 verified end-to-end on the actual files.
 
 ---
 
-## a) Make the compiled stack executable, and prove it
+## 1) Make the compiled stack executable, and prove it
 
 **Root cause.** Modern GCC emits a `.note.GNU-stack` note that tells the linker to
 mark the `PT_GNU_STACK` segment non-executable (`RW`). That default flows through to
@@ -63,7 +61,7 @@ clean:
 
 ---
 
-## b) Call the function from `b/b.o` to print "You're on a streak."
+## 2) Call the function from `b/b.o` to print "You're on a streak."
 
 **Inspection.** `nm b.o` exposes the symbol `T f` plus a private `counter.0` in
 `.bss` and an undefined `puts`. The disassembly (`objdump -dr b.o`) decodes to:
@@ -101,7 +99,7 @@ You're on a streak.
 
 ---
 
-## c) Trigger "You hacked me!" in `c/c`
+## 3) Trigger "You hacked me!" in `c/c`
 
 **Inspection.** `main` (from `objdump -d -M intel c`, strings from
 `objdump -s -j .rodata c`) does:
